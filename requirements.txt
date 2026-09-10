@@ -6,4 +6,4 @@ openpyxl==3.1.5
 nse[server]
 httpx[http2]
 smartapi-python
-pytop
+pyotp
