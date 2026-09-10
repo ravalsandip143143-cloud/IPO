@@ -33,13 +33,23 @@ import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# Angel One + TOTP (login ke liye)
+# Angel One + TOTP (login ke liye) -- abhi optional rakha hai
 try:
     from SmartApi import SmartConnect
     import pyotp
     ANGEL_AVAILABLE = True
 except Exception:
     ANGEL_AVAILABLE = False
+
+# NSE official (unofficial wrapper) -- IPO list ke liye reliable source.
+# InvestorGain/Chittorgarh ka data JavaScript se load hota hai, isliye
+# simple requests se nahi milta -- ye package cookie/session khud handle
+# karke seedha JSON data deta hai NSE se.
+try:
+    from nse import NSE as NSEClient
+    NSE_AVAILABLE = True
+except Exception:
+    NSE_AVAILABLE = False
 
 # ==========================================================================
 # 0. CONSTANTS / PATHS
@@ -127,65 +137,91 @@ def load_deleted():
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+# NSE package apna cookie file yahan store karega
+NSE_DOWNLOAD_DIR = os.path.join(DATA_DIR, "nse_session")
+os.makedirs(NSE_DOWNLOAD_DIR, exist_ok=True)
+
+# NSE SME symbol list ek baar cache kar lete hain (baar baar call na karna pade)
+_nse_sme_symbols_cache = None
+
+
+def _get_nse_sme_symbols():
+    """NSE par listed sabhi SME symbols ka set laata hai (cached)."""
+    global _nse_sme_symbols_cache
+    if _nse_sme_symbols_cache is not None:
+        return _nse_sme_symbols_cache
+    if not NSE_AVAILABLE:
+        return set()
+    try:
+        with NSEClient(NSE_DOWNLOAD_DIR, server=True) as nse:
+            data = nse.listSme()
+        symbols = {item.get("symbol", "").upper() for item in data.get("data", [])}
+        _nse_sme_symbols_cache = symbols
+        return symbols
+    except Exception:
+        return set()
+
 
 def scrape_ipo_list():
     """
-    Chittorgarh / InvestorGain se live IPO list (Mainboard + SME) scrape
-    karta hai. Return: list of dicts with basic fields.
-    Agar site block/change ho jaaye to yaha try/except ke andar wapas
-    aake selector update karna padega.
+    NSE ke official (unofficial wrapper) package se current + upcoming
+    IPO list laata hai. Ye JSON-based hai, isliye InvestorGain/Chittorgarh
+    jaisi JS-rendering wali dikkat nahi aati.
     """
     ipos = []
-    url = "https://www.investorgain.com/report/live-ipo-gmp/331/ipo/"
+    if not NSE_AVAILABLE:
+        st.warning("`nse` package install nahi hai. requirements.txt check karo.")
+        return ipos
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "lxml")
-        table = soup.find("table")
-        if table is None:
-            return ipos
-        rows = table.find_all("tr")[1:]
-        for row in rows:
-            cols = [c.get_text(strip=True) for c in row.find_all("td")]
-            if len(cols) < 5:
+        with NSEClient(NSE_DOWNLOAD_DIR, server=True) as nse_client:
+            current = nse_client.listCurrentIPO() or []
+            upcoming = nse_client.listUpcomingIPO() or []
+
+        sme_symbols = _get_nse_sme_symbols()
+
+        for item in current + upcoming:
+            name = item.get("companyName") or item.get("symbol") or ""
+            if not name:
                 continue
-            name = cols[0]
-            gmp_text = cols[1] if len(cols) > 1 else ""
+            symbol = (item.get("symbol") or "").upper()
+            is_sme = symbol in sme_symbols
             ipos.append({
                 "company_name": name,
-                "gmp_raw": gmp_text,
-                "board_type": "SME" if "SME" in name.upper() else "Mainboard",
+                "board_type": "SME" if is_sme else "Mainboard",
+                "open_date": item.get("issueStartDate"),
+                "close_date": item.get("issueEndDate"),
+                "issue_price_raw": item.get("issuePrice"),
+                "subscription_total": item.get("noOfTime"),  # NSE ka subscription multiple
+                "status": item.get("status"),
             })
     except Exception as e:
-        st.warning(f"IPO list scrape mein dikkat aayi: {e}")
+        st.warning(f"IPO list fetch mein dikkat aayi: {e}")
     return ipos
 
 
 def scrape_gmp_and_subscription(company_name):
     """
-    Ek specific company ka fresh GMP + subscription number nikalta hai.
-    Placeholder logic — real selectors site dekh ke fine-tune karna hoga.
+    NSE apna official data deta hai (subscription), lekin GMP (Grey Market
+    Premium) NSE nahi deta -- ye unofficial/unregulated market ka number
+    hai jo sirf InvestorGain/Chittorgarh jaisi sites par milta hai, aur
+    wo sites JavaScript se data load karti hain (simple scraping se nahi
+    milta).
+    ABHI KE LIYE: GMP None rahega. Isko baad mein alag se solve karenge
+    (jaise unka internal API dhoondh ke, ya manual entry se).
     """
-    try:
-        url = "https://www.investorgain.com/report/live-ipo-gmp/331/ipo/"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "lxml")
-        text = soup.get_text()
-        if company_name.lower() in text.lower():
-            # Simplified placeholder — production mein exact table cell nikalna
-            return {"gmp": None, "subscription_total": None}
-    except Exception:
-        pass
     return {"gmp": None, "subscription_total": None}
 
 
 def is_nse_sme_listed(company_name):
     """
-    SME IPO ka NSE-SME listing check karega (P5).
-    Real implementation: NSE SME list page scrape karke match karna.
-    Abhi placeholder True/False return karta hai — tum NSE SME emerge
-    list ka URL daal ke isko complete kar sakte ho.
+    P5 -- SME IPO ka NSE-SME (NSE Emerge) listing check.
+    Ab real NSE data se check hota hai (scrape_ipo_list mein already
+    is_sme calculate ho chuka hota hai per-company) -- ye function sirf
+    fallback/manual check ke liye rakha hai.
     """
-    return False  # default — refine later with actual NSE SME list scrape
+    sme_symbols = _get_nse_sme_symbols()
+    return company_name.upper() in sme_symbols
 
 
 # ==========================================================================
@@ -368,11 +404,31 @@ def run_daily_update():
         if name not in master["company_name"].values:
             # naya IPO mila -> master mein add karo
             new_row = {c: None for c in MASTER_COLUMNS}
+
+            # Issue price "Rs.200 to Rs.210" jaisa format hota hai NSE se,
+            # ise low/high mein split karte hain
+            price_low, price_high = None, None
+            raw_price = item.get("issue_price_raw")
+            if raw_price:
+                nums = [p.strip().replace("Rs.", "").replace(",", "")
+                        for p in raw_price.replace("Rs.", "").split("to")]
+                try:
+                    if len(nums) == 2:
+                        price_low, price_high = float(nums[0]), float(nums[1])
+                    elif len(nums) == 1:
+                        price_low = price_high = float(nums[0])
+                except ValueError:
+                    pass
+
             new_row.update({
                 "company_name": name,
                 "board_type": item["board_type"],
-                "nse_sme_listed": is_nse_sme_listed(name) if item["board_type"] == "SME" else None,
-                "status": "open",
+                "nse_sme_listed": item["board_type"] == "SME",  # NSE data se hi aaya hai
+                "status": item.get("status") or "open",
+                "open_date": item.get("open_date"),
+                "close_date": item.get("close_date"),
+                "issue_price_low": price_low,
+                "issue_price_high": price_high,
                 "added_on": today,
             })
             new_row["score"] = calculate_score(new_row)
