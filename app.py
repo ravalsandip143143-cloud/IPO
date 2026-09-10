@@ -102,8 +102,11 @@ def save_csv(df, path):
 MASTER_COLUMNS = [
     "company_name", "board_type", "nse_sme_listed", "status",
     "open_date", "close_date", "listing_date",
-    "issue_price_low", "issue_price_high",
+    "issue_price_low", "issue_price_high", "lot_size",
+    "gmp", "gmp_percent",
     "issue_pe", "issue_pb", "issue_debt_equity", "issue_ebitda_margin",
+    "issue_roe", "issue_roce", "issue_eps_pre", "issue_eps_post",
+    "promoter_holding_pre", "promoter_holding_post",
     "issue_debt", "issue_book_value", "issue_market_cap",
     "sector",
     "listing_price", "current_price", "current_pb", "current_debt_equity",
@@ -165,9 +168,12 @@ def _get_nse_sme_symbols():
 
 def scrape_ipo_list():
     """
-    NSE ke official (unofficial wrapper) package se current + upcoming
-    IPO list laata hai. Ye JSON-based hai, isliye InvestorGain/Chittorgarh
-    jaisi JS-rendering wali dikkat nahi aati.
+    NSE ke official (unofficial wrapper) package se current + upcoming +
+    (pichhle 1 saal ke) past/listed IPOs laata hai. Ye JSON-based hai,
+    isliye InvestorGain/Chittorgarh jaisi JS-rendering wali dikkat nahi
+    aati.
+    P9 -- listPastIPO() bhi add kiya taaki listed ho chuki companies bhi
+    hamesha tool mein dikhti rahein (1 saal tak) analysis ke liye.
     """
     ipos = []
     if not NSE_AVAILABLE:
@@ -178,23 +184,35 @@ def scrape_ipo_list():
         with NSEClient(NSE_DOWNLOAD_DIR, server=True) as nse_client:
             current = nse_client.listCurrentIPO() or []
             upcoming = nse_client.listUpcomingIPO() or []
+            try:
+                past = nse_client.listPastIPO(
+                    from_date=dt.datetime.now() - dt.timedelta(days=365),
+                    to_date=dt.datetime.now(),
+                ) or []
+            except Exception:
+                past = []
 
         sme_symbols = _get_nse_sme_symbols()
 
-        for item in current + upcoming:
+        for item in current + upcoming + past:
             name = item.get("companyName") or item.get("symbol") or ""
             if not name:
                 continue
             symbol = (item.get("symbol") or "").upper()
             is_sme = symbol in sme_symbols
+            # past IPO items ka status "Listed" maana jaayega (P9)
+            item_status = item.get("status")
+            if item in past and not item_status:
+                item_status = "Listed"
             ipos.append({
                 "company_name": name,
                 "board_type": "SME" if is_sme else "Mainboard",
                 "open_date": item.get("issueStartDate"),
                 "close_date": item.get("issueEndDate"),
+                "listing_date": item.get("listingDate") or item.get("listing_date"),
                 "issue_price_raw": item.get("issuePrice"),
                 "subscription_total": item.get("noOfTime"),  # NSE ka subscription multiple
-                "status": item.get("status"),
+                "status": item_status,
             })
     except Exception as e:
         st.warning(f"IPO list fetch mein dikkat aayi: {e}")
@@ -229,6 +247,10 @@ def fetch_ipoji_details(company_name):
         "gmp": None, "gmp_percent": None, "subscription_total": None,
         "pe": None, "pb": None, "debt_equity": None,
         "pat_margin": None, "market_cap": None,
+        "lot_size": None, "roe": None, "roce": None,
+        "eps_pre": None, "eps_post": None,
+        "promoter_pre": None, "promoter_post": None,
+        "listing_date": None,
     }
     slug = _company_to_ipoji_slug(company_name)
     if not slug:
@@ -275,6 +297,45 @@ def fetch_ipoji_details(company_name):
         if sub_match:
             result["subscription_total"] = float(sub_match.group(1))
 
+        # Lot size -- "Lot size 107" (P8 -- IPO list table mein dikhega)
+        lot_match = re.search(r"Lot [sS]ize\s*(\d+)", text)
+        if lot_match:
+            result["lot_size"] = float(lot_match.group(1))
+
+        # ROE -- "ROE (Return on Equity — ...) 16.02%"
+        roe_match = re.search(r"\bROE\s*\([^)]*\)\s*([\d.]+)%", text)
+        if roe_match:
+            result["roe"] = float(roe_match.group(1))
+
+        # ROCE -- "ROCE (Return on Capital Employed — ...) 11.89%"
+        roce_match = re.search(r"\bROCE\s*\([^)]*\)\s*([\d.]+)%", text)
+        if roce_match:
+            result["roce"] = float(roce_match.group(1))
+
+        # EPS Pre/Post IPO -- "EPS Pre IPO (...) ₹7.89/-"
+        eps_pre_match = re.search(r"EPS Pre IPO\s*\([^)]*\)\s*₹?\s*([\d.]+)", text)
+        if eps_pre_match:
+            result["eps_pre"] = float(eps_pre_match.group(1))
+        eps_post_match = re.search(r"EPS Post IPO\s*\([^)]*\)\s*₹?\s*([\d.]+)", text)
+        if eps_post_match:
+            result["eps_post"] = float(eps_post_match.group(1))
+
+        # Promoter holding pre/post issue -- "Pre-Issue Holding 92% Post-Issue Holding 63.69%"
+        promoter_pre_match = re.search(r"Pre-Issue Holding\s*([\d.]+)%", text)
+        if promoter_pre_match:
+            result["promoter_pre"] = float(promoter_pre_match.group(1))
+        promoter_post_match = re.search(r"Post-Issue Holding\s*([\d.]+)%", text)
+        if promoter_post_match:
+            result["promoter_post"] = float(promoter_post_match.group(1))
+
+        # Listing date -- "will be listed on the NSE and BSE on 15-Sep-2026"
+        listing_match = re.search(
+            r"listed on (?:the )?(?:NSE|BSE)[^0-9]*?(\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4})",
+            text
+        )
+        if listing_match:
+            result["listing_date"] = listing_match.group(1)
+
     except Exception:
         pass
     return result
@@ -303,25 +364,63 @@ def is_nse_sme_listed(company_name):
 
 def angel_login():
     """
-    Angel One SmartAPI mein daily auto-login karta hai.
-    Secrets Streamlit ke secrets.toml se aayenge (P — token/API safe rakhna).
+    Angel One SmartAPI mein login karta hai.
+
+    P6 -- STABILITY FIX: Pehle ye function har button-click pe naya login
+    kar raha tha, jisse rate-limit / session-conflict ho sakta tha (khaaskar
+    agar same Angel One account ka ek aur tool -- jaise tumhara PCR
+    dashboard -- bhi isi client_id se login kar raha ho). Ab session ko
+    Streamlit ke session_state mein cache kar rahe hain, taaki ek baar
+    login hone ke baad baar-baar naya login na ho.
+
+    IMPORTANT NOTE: Agar tumhara PCR dashboard (ya koi aur tool) isi Angel
+    One account (client_id) se already login hai, to dono tools same waqt
+    login karne ki koshish karenge to session conflict ho sakta hai (Angel
+    One kabhi-kabhi purana session invalidate kar deta hai jab naya login
+    hota hai). Isko avoid karne ka best tareeka: Angel One SmartAPI
+    developer portal (smartapi.angelbroking.com) par ek ALAG/NAYA API app
+    banao is IPO tool ke liye (naya api_key milega, client_id/password/TOTP
+    wahi rahega) -- alag api_key se dono tools independently login kar
+    paayenge, ek dusre ko disturb nahi karenge.
     """
     if not ANGEL_AVAILABLE:
         st.error("SmartApi / pyotp install nahi hai. requirements.txt check karo.")
         return None
+
+    # Agar is Streamlit session mein pehle se hi login ho chuka hai, to
+    # wahi purana object reuse karo -- dobara login mat karo
+    if st.session_state.get("angel_obj") is not None:
+        return st.session_state["angel_obj"]
+
     try:
         api_key = st.secrets["angel"]["api_key"]
         client_id = st.secrets["angel"]["client_id"]
         password = st.secrets["angel"]["password"]
         totp_secret = st.secrets["angel"]["totp_secret"]
+    except Exception:
+        st.error(
+            "Angel One API key/secrets set nahi hai. `.streamlit/secrets.toml` "
+            "(ya Streamlit Cloud ke Settings > Secrets) mein `[angel]` section "
+            "bharke api_key, client_id, password, totp_secret daalo."
+        )
+        return None
 
+    try:
         totp = pyotp.TOTP(totp_secret).now()
         obj = SmartConnect(api_key=api_key)
         session = obj.generateSession(client_id, password, totp)
         if session.get("status"):
+            st.session_state["angel_obj"] = obj  # cache karo, dobara login na ho
             return obj
         else:
-            st.error(f"Angel One login fail: {session}")
+            err_msg = session.get("message", str(session))
+            st.error(
+                f"Angel One login fail: {err_msg}\n\n"
+                "Agar ye baar-baar ho raha hai, ho sakta hai isi client_id "
+                "se koi doosra tool (jaise PCR dashboard) bhi same waqt "
+                "login kar raha ho -- upar wala note padho, alag API key "
+                "banana behtar rahega."
+            )
             return None
     except Exception as e:
         st.error(f"Angel One login error: {e}")
@@ -404,6 +503,25 @@ def score_to_color(score):
         return "#f5b7b1"   # light red
     else:
         return "#e0e0e0"   # light grey (normal)
+
+
+def get_ideal_ranges(sector):
+    """
+    P9 -- Har metric ka "healthy/normal" range batata hai, taaki company
+    select karte waqt turant pata chale ki number achha hai ya kharab.
+    PE/PB/Debt-Equity sector-wise SECTOR_BENCHMARKS se aate hain.
+    ROE/ROCE/PAT Margin ke liye general market-wide accepted thumb-rules
+    use kiye hain (in par sector ka utna farak nahi padta jitna PE/PB pe).
+    """
+    bench = get_benchmark(sector or "Default")
+    return {
+        "PE": f"≤ {bench['pe_max']}x (sector avg)",
+        "PB": f"≤ {bench['pb_max']}x (sector avg)",
+        "Debt/Equity": f"≤ {bench['de_max']} (kam behtar hai)",
+        "PAT Margin / RoNW": "≥ 10-15% (zyada behtar)",
+        "ROE": "≥ 15% (zyada behtar)",
+        "ROCE": "≥ 15% (zyada behtar)",
+    }
 
 
 # ==========================================================================
@@ -500,6 +618,7 @@ def run_daily_update():
                 "status": item.get("status") or "open",
                 "open_date": item.get("open_date"),
                 "close_date": item.get("close_date"),
+                "listing_date": item.get("listing_date"),  # P7
                 "issue_price_low": price_low,
                 "issue_price_high": price_high,
                 "added_on": today,
@@ -536,6 +655,40 @@ def run_daily_update():
                 master.at[idx, "issue_ebitda_margin"] = ipoji_data["pat_margin"]
             if ipoji_data.get("market_cap") is not None:
                 master.at[idx, "issue_market_cap"] = ipoji_data["market_cap"]
+            # P2 -- GMP ab master table mein bhi save hoga (list + detail dono dikhega)
+            if ipoji_data.get("gmp") is not None:
+                master.at[idx, "gmp"] = ipoji_data["gmp"]
+            if ipoji_data.get("gmp_percent") is not None:
+                master.at[idx, "gmp_percent"] = ipoji_data["gmp_percent"]
+            # P8 -- Lot size
+            if ipoji_data.get("lot_size") is not None:
+                master.at[idx, "lot_size"] = ipoji_data["lot_size"]
+            # P7 -- extra analysis fields
+            if ipoji_data.get("roe") is not None:
+                master.at[idx, "issue_roe"] = ipoji_data["roe"]
+            if ipoji_data.get("roce") is not None:
+                master.at[idx, "issue_roce"] = ipoji_data["roce"]
+            if ipoji_data.get("eps_pre") is not None:
+                master.at[idx, "issue_eps_pre"] = ipoji_data["eps_pre"]
+            if ipoji_data.get("eps_post") is not None:
+                master.at[idx, "issue_eps_post"] = ipoji_data["eps_post"]
+            if ipoji_data.get("promoter_pre") is not None:
+                master.at[idx, "promoter_holding_pre"] = ipoji_data["promoter_pre"]
+            if ipoji_data.get("promoter_post") is not None:
+                master.at[idx, "promoter_holding_post"] = ipoji_data["promoter_post"]
+            # P7 -- listing_date fallback (agar NSE se nahi mila to ipoji se)
+            current_listing_date = master.at[idx, "listing_date"]
+            if (pd.isna(current_listing_date) or not current_listing_date) and ipoji_data.get("listing_date"):
+                master.at[idx, "listing_date"] = ipoji_data["listing_date"]
+            # P9 -- agar listing ho chuki hai to status "Listed" set karo
+            # (company permanently tool mein dikhti rahegi, delete nahi hoti)
+            if master.at[idx, "listing_date"] and str(master.at[idx, "status"]).lower() not in ("listed",):
+                try:
+                    ldate = pd.to_datetime(master.at[idx, "listing_date"], errors="coerce")
+                    if pd.notna(ldate) and ldate.date() <= dt.date.today():
+                        master.at[idx, "status"] = "Listed"
+                except Exception:
+                    pass
             master.at[idx, "last_updated"] = today
 
             # Score dobara calculate karo naye data ke saath
@@ -592,14 +745,31 @@ st.caption("Personal use only — SEBI compliance ke liye ye tool online publish
 master_df = load_master()
 deleted_df = load_deleted()
 
+# P4 -- "Manual Refresh" button ab title ke turant niche, main dashboard
+# mein hai (sidebar se hataya), aur box ka background 75% green hai
+st.markdown(
+    """
+    <style>
+    div[data-testid="stButton"] > button#refresh_main_btn {
+        background-color: rgba(46, 204, 113, 0.75);
+        color: white;
+        font-weight: 700;
+        border: none;
+        padding: 0.6em 1.2em;
+        border-radius: 6px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+if st.button("🔄 Manual Refresh (scrape now)", key="refresh_main_btn"):
+    with st.spinner("Data fetch ho raha hai..."):
+        master_df = run_daily_update()
+    st.success("Update ho gaya!")
+
 # Sidebar controls
 st.sidebar.header("Settings")
 board_filter = st.sidebar.radio("Board Type", ["All", "Mainboard", "SME"])
-
-if st.sidebar.button("🔄 Manual Refresh (scrape now)"):
-    with st.spinner("Data fetch ho raha hai..."):
-        master_df = run_daily_update()
-    st.sidebar.success("Update ho gaya!")
 
 if st.sidebar.button("🔐 Angel One Login Test"):
     obj = angel_login()
@@ -625,38 +795,113 @@ else:
         color = score_to_color(val)
         return f"background-color: {color}"
 
-    display_cols = ["company_name", "board_type", "nse_sme_listed", "status",
-                     "issue_price_low", "issue_price_high", "issue_pe", "issue_pb",
-                     "issue_debt_equity", "score"]
+    # P3 -- "issue_price_low" hata diya, sirf high price dikhana hai list mein
+    # P5 -- "nse_sme_listed" column hata diya
+    # P7 -- "listing_date" add kiya
+    # P8 -- "lot_size" column, issue_price_high ke turant baad
+    # P2 -- "gmp"/"gmp_percent" column add kiya taaki GMP list mein bhi turant dikhe
+    # P3 -- ROE, ROCE, EPS Pre/Post, Promoter Holding Pre/Post bhi list
+    # table mein add kiye (pehle sirf detail table mein the)
+    display_cols = ["company_name", "board_type", "status",
+                     "open_date", "close_date", "listing_date",
+                     "issue_price_high", "lot_size", "gmp", "gmp_percent",
+                     "issue_pe", "issue_pb", "issue_debt_equity",
+                     "issue_ebitda_margin", "issue_roe", "issue_roce",
+                     "issue_eps_pre", "issue_eps_post",
+                     "promoter_holding_pre", "promoter_holding_post",
+                     "score"]
     display_cols = [c for c in display_cols if c in view_df.columns]
 
-    styled = view_df[display_cols].style.applymap(highlight_score, subset=["score"]) \
-        if "score" in display_cols else view_df[display_cols].style
+    # P1 -- numbers ko 2 decimal tak round karna (lot_size whole number rakha hai)
+    format_dict = {}
+    numeric_2dp_cols = ["issue_price_high", "gmp", "gmp_percent", "issue_pe",
+                         "issue_pb", "issue_debt_equity", "issue_ebitda_margin",
+                         "issue_roe", "issue_roce", "issue_eps_pre", "issue_eps_post",
+                         "promoter_holding_pre", "promoter_holding_post", "score"]
+    for c in numeric_2dp_cols:
+        if c in display_cols:
+            format_dict[c] = "{:.2f}"
+    if "lot_size" in display_cols:
+        format_dict["lot_size"] = "{:.0f}"
 
-    st.dataframe(styled, use_container_width=True)
+    styled = view_df[display_cols].style.format(format_dict, na_rep="-")
+    if "score" in display_cols:
+        styled = styled.applymap(highlight_score, subset=["score"])
+
+    # P4 -- column header (th) ko dark aur bold banaya
+    styled = styled.set_table_styles([
+        {"selector": "th", "props": [("font-weight", "bold"), ("color", "#111111"),
+                                      ("background-color", "#d9d9d9"), ("text-align", "left")]}
+    ]).hide(axis="index")
+
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
 
     # Company detail view (click-like via selectbox, P3)
     st.subheader("Company Detail")
     selected = st.selectbox("Company select karo detail dekhne ke liye", view_df["company_name"].unique())
     if selected:
         row = view_df[view_df["company_name"] == selected].iloc[0]
+
+        # P6 -- company ka naam bada aur bold
+        st.markdown(
+            f"<h1 style='font-weight:900; font-size:2.2em; color:#111111; margin-bottom:0;'>{selected}</h1>",
+            unsafe_allow_html=True
+        )
+
+        # P6 -- issue low-high price yahan waise hi rehne diya hai (bina round/hataye)
         col1, col2, col3 = st.columns(3)
         col1.metric("Issue Price", f"₹{row.get('issue_price_low','-')} - ₹{row.get('issue_price_high','-')}")
         col2.metric("Listing Price", f"₹{row.get('listing_price','-')}")
         col3.metric("Current Price", f"₹{row.get('current_price','-')}")
 
+        # P1 -- 2 decimal tak round karne ka helper
+        def fmt2(v):
+            try:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return "-"
+                return f"{float(v):.2f}"
+            except (TypeError, ValueError):
+                return v if v not in (None, "") else "-"
+
         st.write("**Fundamentals (Issue time vs Current):**")
+        # P2 -- GMP row add kiya. P7 -- ROE, ROCE, EPS Pre/Post, Promoter
+        # Holding Pre/Post naye analysis fields add kiye (research se pata
+        # chala ki ye bhi IPO judge karne ke liye zaroori metrics hain)
+        # P9 -- "Ideal Range" column add kiya taaki turant pata chale ki
+        # number achha hai ya kharab (sector-wise benchmark se aata hai)
+        metric_names = ["Open Date", "Close Date", "Listing Date",
+                         "GMP", "GMP %", "Lot Size", "PE", "PB", "Debt/Equity",
+                         "PAT Margin / RoNW", "ROE", "ROCE", "EPS Pre IPO",
+                         "EPS Post IPO", "Promoter Holding Pre", "Promoter Holding Post",
+                         "Market Cap"]
+        ideal_ranges = get_ideal_ranges(row.get("sector"))
+
+        def fmt_date(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)) or v in ("", "nan"):
+                return "-"
+            return str(v)
+
         detail_table = pd.DataFrame({
-            "Metric": ["PE", "PB", "Debt/Equity", "EBITDA Margin", "Market Cap"],
-            "At Issue": [row.get("issue_pe"), row.get("issue_pb"),
-                         row.get("issue_debt_equity"), row.get("issue_ebitda_margin"),
-                         row.get("issue_market_cap")],
-            "Current": [None, row.get("current_pb"), row.get("current_debt_equity"),
-                        None, row.get("current_market_cap")],
+            "Metric": metric_names,
+            "At Issue": [
+                fmt_date(row.get("open_date")), fmt_date(row.get("close_date")), fmt_date(row.get("listing_date")),
+                fmt2(row.get("gmp")), fmt2(row.get("gmp_percent")), fmt2(row.get("lot_size")),
+                fmt2(row.get("issue_pe")), fmt2(row.get("issue_pb")), fmt2(row.get("issue_debt_equity")),
+                fmt2(row.get("issue_ebitda_margin")), fmt2(row.get("issue_roe")), fmt2(row.get("issue_roce")),
+                fmt2(row.get("issue_eps_pre")), fmt2(row.get("issue_eps_post")),
+                fmt2(row.get("promoter_holding_pre")), fmt2(row.get("promoter_holding_post")),
+                fmt2(row.get("issue_market_cap")),
+            ],
+            "Current": [
+                "-", "-", "-", "-", "-", "-", "-", fmt2(row.get("current_pb")), fmt2(row.get("current_debt_equity")),
+                "-", "-", "-", "-", "-", "-", "-", fmt2(row.get("current_market_cap")),
+            ],
+            "Ideal Range": [ideal_ranges.get(m, "-") for m in metric_names],
         })
         st.table(detail_table)
+        st.caption("Ideal Range sector-wise benchmark se calculate hota hai (SECTOR_BENCHMARKS dictionary code mein) — company ka sector abhi auto-detect nahi hota, isliye Default range dikh raha hai jab tak 'sector' field manually set na ho.")
 
-        st.write(f"**Score:** {row.get('score','-')}/100")
+        st.write(f"**Score:** {fmt2(row.get('score'))}/100")
         st.write(f"**Anchor Lock-in Expiry:** {row.get('anchor_lockin_expiry','-')}")
         st.write(f"**Promoter Lock-in Expiry:** {row.get('promoter_lockin_expiry','-')}")
 
