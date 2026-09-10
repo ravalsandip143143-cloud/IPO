@@ -24,6 +24,7 @@ STORAGE LOGIC (P6):
 
 import os
 import json
+import re
 import time
 import datetime as dt
 from io import BytesIO
@@ -200,17 +201,89 @@ def scrape_ipo_list():
     return ipos
 
 
+def _company_to_ipoji_slug(company_name):
+    """
+    Company name ko ipoji.com URL slug mein convert karta hai.
+    Example: "Veegaland Developers Limited" -> "veegaland-developers-ipo"
+    NOTE: Ye ek best-effort guess hai -- kuch companies ka slug thoda
+    alag ho sakta hai (jaise short names use karte hain). Agar match
+    na mile to ye function None return karega, aur wo company ke liye
+    GMP/fundamentals khaali reh jaayenge -- manually bhi daal sakte ho.
+    """
+    name = company_name
+    for suffix in [" Limited", " Ltd.", " Ltd", " (India)", " India Limited"]:
+        name = name.replace(suffix, "")
+    slug = re.sub(r"[^a-zA-Z0-9\s-]", "", name).strip().lower()
+    slug = re.sub(r"\s+", "-", slug)
+    return f"{slug}-ipo"
+
+
+def fetch_ipoji_details(company_name):
+    """
+    ipoji.com se ek company ka GMP + fundamentals (P/E, P/B, Debt/Equity,
+    ROE, PAT Margin, Market Cap) nikalta hai. Ye site static HTML deti
+    hai (InvestorGain/Chittorgarh ke ulat), isliye simple requests se
+    kaam ho jaata hai.
+    """
+    result = {
+        "gmp": None, "gmp_percent": None, "subscription_total": None,
+        "pe": None, "pb": None, "debt_equity": None,
+        "pat_margin": None, "market_cap": None,
+    }
+    slug = _company_to_ipoji_slug(company_name)
+    if not slug:
+        return result
+
+    url = f"https://www.ipoji.com/ipo/{slug}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return result
+        text = BeautifulSoup(resp.text, "html.parser").get_text(" ", strip=True)
+
+        # GMP: "IPO GMP today is ₹18 per share (a 13% premium over..."
+        gmp_match = re.search(r"GMP today is\s*₹?\s*([\d.]+)\s*per share.*?(\d+)%\s*premium", text)
+        if gmp_match:
+            result["gmp"] = float(gmp_match.group(1))
+            result["gmp_percent"] = float(gmp_match.group(2))
+
+        # Valuation snapshot sentence: "P/E 25.64, EPS ₹5.46/-, P/B 1.77,
+        # RoNW 16.02%, and market cap ₹682.50 Cr."
+        val_match = re.search(
+            r"valuation snapshot:\s*P/E\s*([\d.]+|N/A),.*?P/B\s*([\d.]+|N/A),\s*RoNW\s*([\d.]+|N/A)%.*?market cap\s*₹?\s*([\d,.]+|N/A)\s*Cr",
+            text
+        )
+        if val_match:
+            pe, pb, ronw, mcap = val_match.groups()
+            result["pe"] = float(pe) if pe != "N/A" else None
+            result["pb"] = float(pb) if pb != "N/A" else None
+            result["pat_margin"] = float(ronw) if ronw != "N/A" else None  # RoNW proxy
+            result["market_cap"] = float(mcap.replace(",", "")) if mcap != "N/A" else None
+
+        # Debt / Equity -- appears as "Debt / Equity (...) 0.32"
+        de_match = re.search(r"Debt\s*/\s*Equity[^0-9]*?([\d.]+)", text)
+        if de_match:
+            result["debt_equity"] = float(de_match.group(1))
+
+        # PAT Margin -- "PAT Margin (...) 10.47%"
+        pat_match = re.search(r"PAT Margin[^0-9]*?([\d.]+)%", text)
+        if pat_match:
+            result["pat_margin"] = float(pat_match.group(1))
+
+        # Subscription total -- "Total 0.02x"
+        sub_match = re.search(r"Total\s*([\d.]+)x", text)
+        if sub_match:
+            result["subscription_total"] = float(sub_match.group(1))
+
+    except Exception:
+        pass
+    return result
+
+
 def scrape_gmp_and_subscription(company_name):
-    """
-    NSE apna official data deta hai (subscription), lekin GMP (Grey Market
-    Premium) NSE nahi deta -- ye unofficial/unregulated market ka number
-    hai jo sirf InvestorGain/Chittorgarh jaisi sites par milta hai, aur
-    wo sites JavaScript se data load karti hain (simple scraping se nahi
-    milta).
-    ABHI KE LIYE: GMP None rahega. Isko baad mein alag se solve karenge
-    (jaise unka internal API dhoondh ke, ya manual entry se).
-    """
-    return {"gmp": None, "subscription_total": None}
+    """ipoji.com se GMP + subscription nikalta hai (fundamentals alag se fetch_ipoji_details mein)."""
+    data = fetch_ipoji_details(company_name)
+    return {"gmp": data["gmp"], "subscription_total": data["subscription_total"]}
 
 
 def is_nse_sme_listed(company_name):
@@ -436,16 +509,40 @@ def run_daily_update():
             master = pd.concat([master, pd.DataFrame([new_row])], ignore_index=True)
             notify_new_ipo(new_row)
 
+        # ipoji.com se GMP + fundamentals dono fetch karo (P2 + scoring data)
+        ipoji_data = fetch_ipoji_details(name)
+
         # GMP history row add karo (P2)
-        gdata = scrape_gmp_and_subscription(name)
         gmp_row = {
             "company_name": name, "date": today,
-            "gmp": gdata.get("gmp"),
+            "gmp": ipoji_data.get("gmp"),
             "subscription_qib": None, "subscription_nii": None,
             "subscription_retail": None,
-            "subscription_total": gdata.get("subscription_total"),
+            "subscription_total": ipoji_data.get("subscription_total"),
         }
         gmp_hist = pd.concat([gmp_hist, pd.DataFrame([gmp_row])], ignore_index=True)
+
+        # Master row mein fundamentals update karo (naya ho ya purana, dono ke liye)
+        row_idx = master.index[master["company_name"] == name]
+        if len(row_idx) > 0:
+            idx = row_idx[0]
+            if ipoji_data.get("pe") is not None:
+                master.at[idx, "issue_pe"] = ipoji_data["pe"]
+            if ipoji_data.get("pb") is not None:
+                master.at[idx, "issue_pb"] = ipoji_data["pb"]
+            if ipoji_data.get("debt_equity") is not None:
+                master.at[idx, "issue_debt_equity"] = ipoji_data["debt_equity"]
+            if ipoji_data.get("pat_margin") is not None:
+                master.at[idx, "issue_ebitda_margin"] = ipoji_data["pat_margin"]
+            if ipoji_data.get("market_cap") is not None:
+                master.at[idx, "issue_market_cap"] = ipoji_data["market_cap"]
+            master.at[idx, "last_updated"] = today
+
+            # Score dobara calculate karo naye data ke saath
+            updated_row = master.loc[idx].to_dict()
+            new_score = calculate_score(updated_row)
+            master.at[idx, "score"] = new_score
+            master.at[idx, "score_color"] = score_to_color(new_score)
 
     save_csv(master, IPO_MASTER_FILE)
     save_csv(gmp_hist, GMP_HISTORY_FILE)
